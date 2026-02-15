@@ -294,8 +294,8 @@ def compute_cost_matrix(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
     Returns:
         Cost matrix [B, B] where C[i,j] = ||x0[i] - x1[j]||²
     """
-    x0_flat = x0.view(x0.size(0), -1)  # [B, D]
-    x1_flat = x1.view(x1.size(0), -1)  # [B, D]
+    x0_flat = x0.reshape(x0.size(0), -1)  # [B, D] - use reshape for non-contiguous
+    x1_flat = x1.reshape(x1.size(0), -1)  # [B, D]
     
     # ||x0[i] - x1[j]||² = ||x0[i]||² + ||x1[j]||² - 2<x0[i], x1[j]>
     x0_sq = (x0_flat ** 2).sum(dim=1, keepdim=True)  # [B, 1]
@@ -374,6 +374,9 @@ def sample_ot_coupling(
     else:
         # Sinkhorn OT - sample from coupling
         P = solve_ot_sinkhorn(cost, reg=reg)
+        # Ensure P is valid for sampling (add small epsilon, renormalize)
+        P = P + 1e-8
+        P = P / P.sum(dim=1, keepdim=True)
         # Sample indices according to coupling
         perm = torch.multinomial(P, num_samples=1).squeeze(-1)
         return x0, x1[perm]
