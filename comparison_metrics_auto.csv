@@ -1,0 +1,14 @@
+method,ssim,psnr,train_time,infer_time,notes,source
+Bicubic,0.87,28.24,N/A,,Baseline,Super_resolution/TRULY_UNPAIRED_README.md
+DDIB,0.10,21,Medium,Medium,,Super_resolution/FLOW_MATCHING_README.md
+Deterministic,0.88,,,,,Super_resolution/FINAL_README.md
+Flow Matching,0.11,22,Medium,Fast,,Super_resolution/FLOW_MATCHING_README.md
+Flow Matching Deterministic (Unpaired),0.7772,27.93,,,,Super_resolution/FINAL_README.md
+Flow Matching Paired,0.25,24.49,42s,,LR↔HR from same trajectory,Super_resolution/TRULY_UNPAIRED_README.md
+Flow Matching Stochastic (Unpaired),0.5161,25.91,,,,Super_resolution/FINAL_README.md
+Flow Matching Unpaired (OT),0.27,24.36,65s,,"LR, HR from DIFFERENT trajectories",Super_resolution/TRULY_UNPAIRED_README.md
+SDEdit,0.09,20,Medium,Slow,,Super_resolution/FLOW_MATCHING_README.md
+Stochastic,0.39,,,,,Super_resolution/FINAL_README.md
+Stochastic (σ=0.05),0.52,,,,,Super_resolution/FINAL_README.md
+Stochastic (σ=0.1),0.27,,,,,Super_resolution/FINAL_README.md
+VAE,0.07,19,Fast,Fast,,Super_resolution/FLOW_MATCHING_README.md

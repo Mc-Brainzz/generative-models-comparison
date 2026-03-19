@@ -135,7 +135,7 @@ def main():
     results.append(run_experiment("Diverse Outputs (SDE)", config_diverse))
     
     # =========================================================================
-    # Experiment 3: Unpaired Data with OT coupling
+    # Experiment 3: Unpaired Data with CycleGAN coupling (replaces OT)
     # =========================================================================
     config_unpaired = Config(
         n_images=300,
@@ -143,13 +143,14 @@ def main():
         inference_steps=50,
         base_channels=32,
         fm_type='stochastic',
-        coupling_mode='unpaired',   # Use Optimal Transport coupling
+        coupling_mode='cyclegan',   # Use CycleGAN pseudo-target coupling
         ot_reg=0.01,                # Sinkhorn regularization
+        cyclegan_pretrain_epochs=6,
         inference_mode='ode',
         batch_size=8,
         seed=123
     )
-    results.append(run_experiment("Unpaired Data (OT)", config_unpaired))
+    results.append(run_experiment("Unpaired Data (CycleGAN)", config_unpaired))
     
     # =========================================================================
     # Summary
@@ -176,8 +177,8 @@ def main():
    - Each run produces different plausible outputs
    - Good for uncertainty estimation
    
-3. UNPAIRED DATA (OT coupling):
-   - Tests mini-batch Optimal Transport
+3. UNPAIRED DATA (CycleGAN coupling):
+    - Uses CycleGAN pseudo-targets instead of OT matching
    - Useful when paired data unavailable
    - Usually slightly lower than paired training
 """)

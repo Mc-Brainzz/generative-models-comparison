@@ -106,7 +106,19 @@ class Config:
     # Data Coupling Mode
     # 'paired': Direct (x0, x1) pairs from degradation
     # 'unpaired': Mini-batch OT coupling
-    coupling_mode: Literal['paired', 'unpaired'] = 'paired'
+    # 'cyclegan': Use CycleGAN pseudo-targets instead of OT matching
+    coupling_mode: Literal['paired', 'unpaired', 'cyclegan'] = 'paired'
+
+    # CycleGAN Coupling (used when coupling_mode='cyclegan')
+    cyclegan_pretrain_epochs: int = 6
+    cyclegan_lr_g: float = 2e-4
+    cyclegan_lr_d: float = 2e-4
+    cyclegan_beta1: float = 0.5
+    cyclegan_beta2: float = 0.999
+    cyclegan_lambda_cycle: float = 10.0
+    cyclegan_lambda_edge: float = 4.0
+    cyclegan_lambda_tv: float = 1e-5
+    cyclegan_gan_start_epoch: int = 2
     
     # Stochastic Interpolant Parameters
     # Controls the amount of noise injected during training
@@ -759,6 +771,143 @@ def prepare_data_loaders(
     return train_loader, x1_val, x0_val, lr_val
 
 
+def _train_cyclegan_coupler(
+    train_loader: DataLoader,
+    config: Config,
+    device: torch.device
+) -> nn.Module:
+    """Pretrain CycleGAN generator G: LR -> HR to provide pseudo-target coupling."""
+    from cyclegan_sr import (
+        Config as CycleGANConfig,
+        Generator,
+        Discriminator,
+        DegradationOperator,
+        GANLoss,
+        gradient_magnitude,
+        total_variation_loss,
+    )
+
+    x0_all = []
+    x1_all = []
+    for x0_batch, x1_batch in train_loader:
+        x0_all.append(x0_batch)
+        x1_all.append(x1_batch)
+    x0_all = torch.cat(x0_all, dim=0)
+    x1_all = torch.cat(x1_all, dim=0)
+
+    lr_all = F.interpolate(
+        x0_all,
+        scale_factor=1.0 / config.downsample_factor,
+        mode='bilinear',
+        align_corners=False,
+    )
+
+    cyc_cfg = CycleGANConfig(
+        seed=config.seed,
+        n_images=x1_all.size(0),
+        points_per_image=config.points_per_image,
+        hr_resolution=config.hr_resolution,
+        downsample_factor=config.downsample_factor,
+        blur_sigma=config.blur_sigma,
+        blur_radius=config.blur_radius,
+        epochs=config.cyclegan_pretrain_epochs,
+        batch_size=config.batch_size,
+        lr_g=config.cyclegan_lr_g,
+        lr_d=config.cyclegan_lr_d,
+        beta1=config.cyclegan_beta1,
+        beta2=config.cyclegan_beta2,
+        lambda_cycle=config.cyclegan_lambda_cycle,
+        lambda_identity=0.0,
+        lambda_edge=config.cyclegan_lambda_edge,
+        lambda_tv=config.cyclegan_lambda_tv,
+        gan_start_epoch=config.cyclegan_gan_start_epoch,
+        base_channels=max(config.base_channels, 32),
+        n_residual_blocks=4,
+    )
+
+    generator = Generator(cyc_cfg).to(device)
+    discriminator = Discriminator(cyc_cfg).to(device)
+    degradation = DegradationOperator(cyc_cfg).to(device)
+
+    optimizer_g = torch.optim.Adam(
+        generator.parameters(),
+        lr=cyc_cfg.lr_g,
+        betas=(cyc_cfg.beta1, cyc_cfg.beta2),
+    )
+    optimizer_d = torch.optim.Adam(
+        discriminator.parameters(),
+        lr=cyc_cfg.lr_d,
+        betas=(cyc_cfg.beta1, cyc_cfg.beta2),
+    )
+
+    gan_loss = GANLoss(use_lsgan=True)
+    l1_loss = nn.L1Loss()
+
+    hr_loader = DataLoader(TensorDataset(x1_all), batch_size=cyc_cfg.batch_size, shuffle=True, drop_last=True)
+    lr_loader = DataLoader(TensorDataset(lr_all), batch_size=cyc_cfg.batch_size, shuffle=True, drop_last=True)
+
+    print(f"\n--- Pretraining CycleGAN Coupler ({cyc_cfg.epochs} epochs) ---")
+    for epoch in range(1, cyc_cfg.epochs + 1):
+        generator.train()
+        discriminator.train()
+        g_epoch = 0.0
+        d_epoch = 0.0
+        n_batches = 0
+
+        hr_iter = iter(hr_loader)
+        lr_iter = iter(lr_loader)
+        for _ in range(min(len(hr_loader), len(lr_loader))):
+            real_hr = next(hr_iter)[0].to(device)
+            real_lr = next(lr_iter)[0].to(device)
+
+            optimizer_g.zero_grad(set_to_none=True)
+            fake_hr = generator(real_lr)
+
+            if epoch >= cyc_cfg.gan_start_epoch:
+                pred_fake = discriminator(fake_hr)
+                loss_gan = gan_loss(pred_fake, True)
+            else:
+                loss_gan = torch.tensor(0.0, device=device)
+
+            recon_lr = degradation(fake_hr)
+            loss_cycle = l1_loss(recon_lr, real_lr) * cyc_cfg.lambda_cycle
+            loss_edge = l1_loss(
+                gradient_magnitude(recon_lr),
+                gradient_magnitude(real_lr),
+            ) * cyc_cfg.lambda_edge
+            loss_tv = total_variation_loss(fake_hr) * cyc_cfg.lambda_tv
+
+            loss_g = loss_gan + loss_cycle + loss_edge + loss_tv
+            loss_g.backward()
+            optimizer_g.step()
+
+            if epoch >= cyc_cfg.gan_start_epoch:
+                optimizer_d.zero_grad(set_to_none=True)
+                pred_real = discriminator(real_hr)
+                loss_d_real = gan_loss(pred_real, True)
+                pred_fake = discriminator(fake_hr.detach())
+                loss_d_fake = gan_loss(pred_fake, False)
+                loss_d = 0.5 * (loss_d_real + loss_d_fake)
+                loss_d.backward()
+                optimizer_d.step()
+            else:
+                loss_d = torch.tensor(0.0, device=device)
+
+            g_epoch += loss_g.item()
+            d_epoch += loss_d.item()
+            n_batches += 1
+
+        print(
+            f"CycleGAN Epoch {epoch:02d}/{cyc_cfg.epochs} | "
+            f"G: {g_epoch / max(n_batches, 1):.5f} | D: {d_epoch / max(n_batches, 1):.5f}"
+        )
+
+    generator.eval()
+    for p in generator.parameters():
+        p.requires_grad_(False)
+    return generator
+
+
 # =============================================================================
 # Training
 # =============================================================================
@@ -792,6 +941,10 @@ def train_flow_matching(
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, config.epochs)
     mse_loss = nn.MSELoss()
+
+    cyclegan_generator = None
+    if config.coupling_mode == 'cyclegan':
+        cyclegan_generator = _train_cyclegan_coupler(train_loader, config, device)
     
     model.train()
     
@@ -802,11 +955,19 @@ def train_flow_matching(
         for x0_batch, x1_batch in train_loader:
             batch_size = x0_batch.size(0)
             
-            # Optional: Mini-batch OT coupling for unpaired data
             if config.coupling_mode == 'unpaired':
                 x0_batch, x1_batch = sample_ot_coupling(
                     x0_batch, x1_batch, reg=config.ot_reg
                 )
+            elif config.coupling_mode == 'cyclegan':
+                with torch.no_grad():
+                    lr_batch = F.interpolate(
+                        x0_batch,
+                        scale_factor=1.0 / config.downsample_factor,
+                        mode='bilinear',
+                        align_corners=False,
+                    )
+                    x1_batch = cyclegan_generator(lr_batch)
             
             # Sample random time t ~ U[0, 1]
             t = torch.rand(batch_size, 1, 1, 1, device=device)
@@ -1275,7 +1436,7 @@ def experiment_paired_vs_unpaired(
     
     results = {}
     
-    for coupling_mode in ['paired', 'unpaired']:
+    for coupling_mode in ['paired', 'unpaired', 'cyclegan']:
         print(f"\n--- Coupling Mode: {coupling_mode.upper()} ---")
         
         exp_config = Config(
@@ -1305,8 +1466,9 @@ def experiment_paired_vs_unpaired(
     print("\n" + "="*60)
     print("COMPARISON SUMMARY")
     print("="*60)
-    print(f"Paired:   SSIM={results['paired']['ssim']:.4f}, PSNR={results['paired']['psnr']:.2f}dB")
-    print(f"Unpaired: SSIM={results['unpaired']['ssim']:.4f}, PSNR={results['unpaired']['psnr']:.2f}dB")
+    print(f"Paired:    SSIM={results['paired']['ssim']:.4f}, PSNR={results['paired']['psnr']:.2f}dB")
+    print(f"Unpaired:  SSIM={results['unpaired']['ssim']:.4f}, PSNR={results['unpaired']['psnr']:.2f}dB")
+    print(f"CycleGAN:  SSIM={results['cyclegan']['ssim']:.4f}, PSNR={results['cyclegan']['psnr']:.2f}dB")
     
     return results
 
@@ -1330,7 +1492,7 @@ def main():
         n_images=600,
         epochs=30,
         fm_type='stochastic',  # 'stochastic' or 'deterministic'
-        coupling_mode='paired',  # 'paired' or 'unpaired'
+        coupling_mode='paired',  # 'paired', 'unpaired', or 'cyclegan'
         sigma_max=0.1,
         inference_mode='ode',  # 'ode' or 'sde'
         inference_steps=50
@@ -1388,7 +1550,8 @@ Key Implementation Features:
    
 3. DATA COUPLING:
    • Paired: Direct (degraded, clean) pairs
-   • Unpaired: Mini-batch Optimal Transport coupling
+    • Unpaired: Mini-batch Optimal Transport coupling
+    • CycleGAN: Pseudo-target coupling using G(LR) instead of OT
    
 4. INFERENCE METHODS:
    • ODE: Deterministic, integrates dx = v(x,t)dt

@@ -25,7 +25,7 @@ from flow_matching import (
     Config, set_seed, get_device, InterpolantSchedule,
     VelocityUNet, van_der_pol_ode, points_to_image,
     degrade_operator, sample_ot_coupling, compute_ssim_scores,
-    compute_psnr, flow_matching_inference
+    compute_psnr, flow_matching_inference, _train_cyclegan_coupler
 )
 from scipy.integrate import solve_ivp
 
@@ -76,16 +76,17 @@ def generate_trajectory_images(
 
 def create_truly_unpaired_dataset(config: Config, device: torch.device):
     """
-    Create truly unpaired dataset:
+    Create truly unpaired dataset with proper GAN pretraining split:
     - HR images from one set of trajectories (Dataset A)
     - LR images from DIFFERENT trajectories (Dataset B)
+    - Split: First half for GAN pretraining, second half for FM training
     - Test set with paired data to evaluate reconstruction
     """
-    print("\n--- Creating TRULY UNPAIRED Dataset ---")
+    print("\n--- Creating TRULY UNPAIRED Dataset (with GAN Pretraining Split) ---")
     
     # Dataset A: HR images (for training target distribution)
     print("Generating HR images (Dataset A)...")
-    HR_train = generate_trajectory_images(
+    HR_train_full = generate_trajectory_images(
         n_images=config.n_images,
         config=config,
         device=device,
@@ -104,7 +105,7 @@ def create_truly_unpaired_dataset(config: Config, device: torch.device):
     )
     
     # Degrade Dataset B to get LR
-    LR_train = degrade_operator(
+    LR_train_full = degrade_operator(
         HR_for_LR,
         blur_sigma=config.blur_sigma,
         blur_radius=config.blur_radius,
@@ -112,12 +113,20 @@ def create_truly_unpaired_dataset(config: Config, device: torch.device):
     )
     
     # Upsample LR for flow matching input
-    LR_up_train = F.interpolate(
-        LR_train,
+    LR_up_train_full = F.interpolate(
+        LR_train_full,
         scale_factor=config.downsample_factor,
         mode='bilinear',
         align_corners=False
     )
+    
+    # SPLIT: First half for GAN pretraining, second half for FM training
+    split_idx = config.n_images // 2
+    HR_pretrain = HR_train_full[:split_idx]  # For GAN pretraining
+    LR_up_pretrain = LR_up_train_full[:split_idx]
+    
+    HR_fm_train = HR_train_full[split_idx:]  # For FM training (unseen by GAN)
+    LR_up_fm_train = LR_up_train_full[split_idx:]
     
     # Test set: PAIRED data to properly evaluate reconstruction
     print("Generating PAIRED test set for evaluation...")
@@ -137,36 +146,62 @@ def create_truly_unpaired_dataset(config: Config, device: torch.device):
     )
     
     print(f"\nDataset Summary:")
-    print(f"  Training HR (Dataset A): {HR_train.shape} - from trajectories with μ ∈ [0.5, 1.5]")
-    print(f"  Training LR (Dataset B): {LR_train.shape} - from DIFFERENT trajectories with μ ∈ [1.0, 2.0]")
-    print(f"  Test (Paired): {HR_test.shape} HR, {LR_test.shape} LR")
-    print(f"\n  ⚠️  Training LR and HR have NO correspondence!")
+    print(f"  Pretraining HR (Dataset A, first 50%): {HR_pretrain.shape} - from trajectories with μ ∈ [0.5, 1.5]")
+    print(f"  Pretraining LR (Dataset B, first 50%): {LR_up_pretrain.shape} - from trajectories with μ ∈ [1.0, 2.0]")
+    print(f"  FM Training HR (Dataset A, second 50%): {HR_fm_train.shape} - from trajectories with μ ∈ [0.5, 1.5]")
+    print(f"  FM Training LR (Dataset B, second 50%): {LR_up_fm_train.shape} - from trajectories with μ ∈ [1.0, 2.0]")
+    print(f"  Test (Paired): {HR_test.shape} HR, {LR_test.shape} LR - from trajectories with μ ∈ [0.7, 1.8]")
+    print(f"\n  ⚠️  GAN sees first 50% of unpaired data during pretraining")
+    print(f"  ⚠️  FM training uses second 50% (UNSEEN by GAN)")
+    print(f"  ⚠️  Training LR and HR have NO correspondence!")
     print(f"  ✓  Test set is paired for proper evaluation")
     
-    return HR_train, LR_up_train, HR_test, LR_test
+    return HR_pretrain, LR_up_pretrain, HR_fm_train, LR_up_fm_train, HR_test, LR_test
 
 
 def train_truly_unpaired(
     model: nn.Module,
-    x0_train: torch.Tensor,  # Upsampled LR (source)
-    x1_train: torch.Tensor,  # HR (target) - from DIFFERENT samples!
+    x0_pretrain: torch.Tensor,  # LR for GAN pretraining
+    x1_pretrain: torch.Tensor,  # HR for GAN pretraining
+    x0_train: torch.Tensor,     # LR for FM training (UNSEEN by GAN)
+    x1_train: torch.Tensor,     # HR for FM training (UNSEEN by GAN)
     config: Config,
     device: torch.device
 ) -> nn.Module:
     """
-    Train with truly unpaired data using OT coupling.
+    Train with truly unpaired data using OT or CycleGAN coupling.
     
     Key difference: x0 and x1 come from completely different trajectories!
-    OT coupling finds the best matching within each mini-batch.
+    - x0_pretrain, x1_pretrain: Used to pretrain CycleGAN
+    - x0_train, x1_train: Used for FM training (NOT seen by GAN)
+    - OT mode: best matching within each mini-batch.
+    - CycleGAN mode: pseudo-target coupling via pretrained G(LR).
     """
     print(f"\n--- Training with TRULY UNPAIRED Data ---")
-    print(f"Using mini-batch Optimal Transport to couple LR↔HR")
+    if config.coupling_mode == 'cyclegan':
+        print("Using CycleGAN pseudo-target coupling to map LR→HR")
+        print(f"  → GAN pretrained on {x0_pretrain.size(0)} unpaired samples")
+        print(f"  → FM trained on {x0_train.size(0)} DIFFERENT unpaired samples (unseen by GAN)")
+    else:
+        print("Using mini-batch Optimal Transport to couple LR↔HR")
     
     schedule = InterpolantSchedule('stochastic', sigma_max=config.sigma_max)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, config.epochs)
     mse_loss = nn.MSELoss()
+
+    cyclegan_generator = None
+    if config.coupling_mode == 'cyclegan':
+        pretrain_loader = DataLoader(
+            TensorDataset(x0_pretrain, x1_pretrain),
+            batch_size=config.batch_size,
+            shuffle=True,
+            drop_last=True,
+        )
+        print(f"\n[GAN Pretraining Phase] Training CycleGAN on {x0_pretrain.size(0)} samples...")
+        cyclegan_generator = _train_cyclegan_coupler(pretrain_loader, config, device)
+        print(f"[GAN Pretraining Complete] Now using G for FM training on UNSEEN data...\n")
     
     n_samples = x0_train.size(0)
     model.train()
@@ -184,10 +219,19 @@ def train_truly_unpaired(
             x0_batch = x0_train[perm0[i:i+config.batch_size]]
             x1_batch = x1_train[perm1[i:i+config.batch_size]]
             
-            # OT coupling: find best matching within mini-batch
-            x0_batch, x1_batch = sample_ot_coupling(
-                x0_batch, x1_batch, reg=config.ot_reg
-            )
+            if config.coupling_mode == 'cyclegan':
+                with torch.no_grad():
+                    lr_batch = F.interpolate(
+                        x0_batch,
+                        scale_factor=1.0 / config.downsample_factor,
+                        mode='bilinear',
+                        align_corners=False,
+                    )
+                    x1_batch = cyclegan_generator(lr_batch)
+            else:
+                x0_batch, x1_batch = sample_ot_coupling(
+                    x0_batch, x1_batch, reg=config.ot_reg
+                )
             
             # Sample time
             t = torch.rand(config.batch_size, 1, 1, 1, device=device)
@@ -292,7 +336,7 @@ def main():
       - LR images: Generated from Van der Pol trajectories (Dataset B)
       - HR images: Generated from DIFFERENT trajectories (Dataset A)
       - NO correspondence between LR and HR samples!
-      - OT coupling finds best matching within each mini-batch
+    - Coupling can use OT matching or CycleGAN pseudo-targets
     
     TESTING:
       - Paired LR-HR data (different from training)
@@ -305,8 +349,9 @@ def main():
         batch_size=8,
         base_channels=32,
         fm_type='stochastic',
-        coupling_mode='unpaired',
+        coupling_mode='cyclegan',
         ot_reg=0.01,
+        cyclegan_pretrain_epochs=6,
         inference_mode='ode',
         inference_steps=50,
         seed=42
@@ -315,8 +360,8 @@ def main():
     set_seed(config.seed)
     device = get_device()
     
-    # Create truly unpaired dataset
-    HR_train, LR_up_train, HR_test, LR_test = create_truly_unpaired_dataset(config, device)
+    # Create truly unpaired dataset with split for GAN pretraining
+    HR_pretrain, LR_up_pretrain, HR_fm_train, LR_up_fm_train, HR_test, LR_test = create_truly_unpaired_dataset(config, device)
     
     # Create and train model
     model = VelocityUNet(base_channels=config.base_channels).to(device)
@@ -324,7 +369,12 @@ def main():
     print(f"\nModel parameters: {n_params:,}")
     
     start_time = time.time()
-    model = train_truly_unpaired(model, LR_up_train, HR_train, config, device)
+    model = train_truly_unpaired(
+        model, 
+        LR_up_pretrain, HR_pretrain,  # Data for GAN pretraining
+        LR_up_fm_train, HR_fm_train,  # Data for FM training (unseen by GAN)
+        config, device
+    )
     train_time = time.time() - start_time
     print(f"Training time: {train_time:.1f}s")
     
@@ -337,7 +387,10 @@ def main():
     )
     
     print(f"\n{'='*50}")
-    print(f"RESULTS (Truly Unpaired Training)")
+    print(f"RESULTS (Truly Unpaired Training - {config.coupling_mode.upper()} coupling)")
+    print(f"  ✓ GAN pretrained on 50% of unpaired data")
+    print(f"  ✓ FM trained on DIFFERENT 50% (unseen by GAN)")
+    print(f"  ✓ Evaluated on completely separate paired test set")
     print(f"{'='*50}")
     print(f"Mean SSIM: {mean_ssim:.4f}")
     print(f"Mean PSNR: {mean_psnr:.2f} dB")
@@ -363,9 +416,14 @@ def main():
     print("\n" + "=" * 70)
     print("INTERPRETATION")
     print("=" * 70)
-    print("""
+    if config.coupling_mode == 'cyclegan':
+        coupling_line = "✓ CycleGAN pseudo-target coupling replaced OT matching"
+    else:
+        coupling_line = "✓ OT coupling successfully matched unpaired LR↔HR distributions"
+
+    print(f"""
     If the model improves over bicubic baseline, it means:
-    ✓ OT coupling successfully matched unpaired LR↔HR distributions
+    {coupling_line}
     ✓ Model learned the general degradation→restoration mapping
     ✓ This works even without explicit paired training data!
     
